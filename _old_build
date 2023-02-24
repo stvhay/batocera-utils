@@ -1,0 +1,87 @@
+#!/usr/bin/env/python
+
+import argparse
+import os
+import regex as re
+import rich
+import rich.progress
+import subprocess
+
+
+class BuildProgress:
+    _progress = rich.progress.Progress(
+        rich.progress.TextColumn("{task.fields[board]}", justify="left"),
+        rich.progress.BarColumn(),
+        rich.progress.TextColumn("{task.completed}/{task.total}"),
+        rich.progress.TimeElapsedColumn(),
+        rich.progress.TextColumn("{task.fields[package]} ({task.fields[stage]})", justify="left"),
+        rich.progress.SpinnerColumn()
+    )
+
+    @classmethod
+    def start(cls):
+        cls._progress.start()
+
+    @classmethod
+    def stop(cls):
+        cls._progress.stop()
+
+    def __init__(self, board, total):
+        self._task_id = BuildProgress._progress.add_task(
+            board,
+            board=board,
+            package='',
+            stage='',
+            total=total
+        )
+        self.__call__('','', 0)
+
+    def __call__(self, package, stage, completed):
+        BuildProgress._progress.update(self._task_id, package=package, stage=stage, completed=completed)
+
+
+def build_order(board):
+    packages = {}
+    pkg_num = 0
+    if board=='':
+        make_rule = 'show-build-order'
+    else:   
+        make_rule = f'{board}-show-build-order'
+    with subprocess.Popen(['make', make_rule], stdout=subprocess.PIPE, text=True) as proc:
+        for line in iter(proc.stdout.readline,''):
+            m = re.match(r'^[\w_\-]+$', line.strip("\r\n"))
+            if m:
+                packages[m[0]]=pkg_num
+                pkg_num += 1
+    return packages
+
+
+def build(board):
+    print(f"Building Board: {board}")
+    print(f"Determining build order...")
+    packages = build_order(board)
+
+    callback=BuildProgress(board, len(packages))
+    BuildProgress.start()
+    build_path = f'output/{board}/build'
+    os.makedirs(build_path, exist_ok = True)
+    with open(f'{build_path}/build.log','w') as log:
+        with subprocess.Popen(['make', f'{board}-build'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+            for line in iter(proc.stdout.readline,''):
+                log.write(line)
+                log.flush()
+                m = re.match(r'.*>>> ([\w_\-]+) ([\w_\.\-]+) ([\w_\-]+)', line)
+                if m:
+                    package, version, stage = m.groups()
+                    callback(package, stage, completed=packages[package])
+    BuildProgress.stop()
+
+
+if __name__ == '__main__':
+    default_board = 'rk3588'
+    parser = argparse.ArgumentParser(description='Build Batocera')
+    parser.add_argument('--board',  metavar='BOARD',  help='The name of the board to upload images for',    default=os.environ.get('board', default_board))
+    args = parser.parse_args()
+
+    board = args.board
+    build(board)

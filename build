@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Run the actual build script in a venv. (In the src/ directory)
+script_dir="$(dirname -- "$0")"
+"$script_dir/venv/bin/python" "$script_dir/src/$(basename -- "$0")" $@ || exit 1
+
+
+# Mount your bucket so we can build the index.html files.
+
+# This is a bit of a hack/workaround for the indexer.py script which really
+# wants a file system to crawl. The indexer script creates index.html files 
+# for directory navigation.
+
+s3fs_domain="static.st5ve.com"
+
+echo "Mounting s3fs..."
+s3fs "$s3fs_domain" ~/s3-drive -o use_path_request_style
+
+if [[ -d "$HOME/s3-drive/batocera" ]]; then
+    echo "Running indexer script..."
+    "$script_dir/venv/bin/python" "$script_dir/src/indexer.py" -r "$HOME/s3-drive/batocera" || exit 1
+fi
+
+# If you have btrfs you can do this if you want--it gives you about 10% back 
+# with multiple architectures building on the same file system.
+
+#echo "Running deduplication in background."
+#if [[ "$(stat -f . --print '%T')" -eq btrfs ]]; then
+#    sudo nohup duperemove -dhr . 2>&1 > "$HOME/.dedup.log" &
+#fi

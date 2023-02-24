@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+
+import argparse
+import boto3
+from collections import defaultdict
+import fnmatch
+import jinja2
+import mimetypes
+import os
+import pathlib
+import re
+import rich.progress
+import s3fs
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib
+import time
+import types
+
+
+class ProgressPercentage:
+    _progress = rich.progress.Progress(
+        rich.progress.TextColumn("{task.fields[url]}", justify="left"),
+        rich.progress.BarColumn(),
+        "[progress.percentage]{task.percentage:>3.1f}%",
+        rich.progress.DownloadColumn(),
+        rich.progress.TransferSpeedColumn(),
+        rich.progress.TimeRemainingColumn(),
+        refresh_per_second=2
+    )
+
+    _lock = threading.Lock()
+
+    @classmethod
+    def start(cls):
+        cls._progress.start()
+
+    @classmethod
+    def stop(cls):
+        cls._progress.stop()
+
+    def __init__(self, filename, url):
+        self._task_id = ProgressPercentage._progress.add_task(
+            filename,
+            url=url,
+            filename=filename,
+            total=os.path.getsize(filename)
+        )
+        self.__call__(0)
+
+    def __call__(self, advance):
+        with ProgressPercentage._lock:
+            ProgressPercentage._progress.update(self._task_id, advance=advance)
+
+
+class BuildProgress:
+    _progress = rich.progress.Progress(
+        rich.progress.TextColumn("{task.fields[board]}", justify="left"),
+        rich.progress.TextColumn("{task.fields[package]} {task.fields[stage]}", justify="left"),
+        rich.progress.BarColumn(),
+        rich.progress.TextColumn("{task.completed}/{task.total}"),
+        rich.progress.TimeElapsedColumn(),
+        rich.progress.SpinnerColumn()
+    )
+
+    @classmethod
+    def start(cls):
+        cls._progress.start()
+
+    @classmethod
+    def stop(cls):
+        cls._progress.stop()
+
+    def __init__(self, board, total):
+        self._task_id = BuildProgress._progress.add_task(
+            board,
+            board=board,
+            package='',
+            version='',
+            stage='',
+            total=total
+        )
+        self.__call__('', '', '', 0)
+
+    def __call__(self, package, version, stage, completed):
+        BuildProgress._progress.update(self._task_id, package=package, version=version, stage=stage, completed=completed)
+
+
+# From a ParsePath, creates an iterable manifest of files for an update package. 
+# The manifest includes a subdirectory for the files.
+class BuildPackage:
+    def __init__(self, parse_path, suffix=None):
+        self._include_version = False
+        self.suffix = suffix
+        self.parse_path = parse_path
+        self._update()
+
+    @property
+    def include_version(self):
+        return self._include_version
+    
+    @include_version.setter
+    def include_version(self, val):
+        self._include_version = val
+        self._update()
+
+    def _update_subdir(self):
+        self.subdir = self.parse_path.board
+        if self.include_version:
+            self.subdir = os.path.join(self.subdir, '-'.join([self.parse_path.version, self.parse_path.subversion]))
+            if self.suffix:
+                self.subdir += f'-{self.suffix}'
+
+            
+
+    def _update_img(self):
+        if self.parse_path.board == self.parse_path.soc:
+            self.img = '-'.join([self.parse_path.project, self.parse_path.board, self.parse_path.version, self.parse_path.subversion])
+        else:
+            self.img = '-'.join([self.parse_path.project, self.parse_path.soc, self.parse_path.board, self.parse_path.version, self.parse_path.subversion])
+        if self.suffix:
+            self.img += f'-{self.suffix}'
+        self.img += '.img.gz'
+
+    def _update(self):
+        self._update_subdir()
+        self._update_img()
+
+    def __iter__(self):
+        self._update()
+        yield os.path.join(self.subdir, self.img)
+        yield os.path.join(self.subdir, f'{self.img}.sha256')
+        yield os.path.join(self.subdir, f'{self.img}.md5')
+        yield os.path.join(self.subdir, 'boot.tar.xz')
+        yield os.path.join(self.subdir, 'boot.tar.xz.sha256')
+        yield os.path.join(self.subdir, 'boot.tar.xz.md5')
+        yield os.path.join(self.subdir, 'batocera.version')
+
+
+# Given a build path for an image, it will parse the relevant information
+class InvalidSourcePath(Exception):
+    pass
+class ParsePath:
+    def __init__(self, p):
+        self.base_path, self.img = os.path.split(p)
+        parts = pathlib.Path(self.base_path).parts
+        if len(parts) > 4:
+            self.board = parts[-1]
+            self.project = parts[-3]
+            self.soc = parts[-5]
+        else:
+            raise InvalidSourcePath(self.base_path)
+        print(self.img)
+        print(self.project)
+        print(self.soc)
+        print(self.board)
+        if self.soc == self.board:
+            img_re = rf'{self.project}-{self.soc}-(\d+)-(\d{{8}}.*)\.img.gz'
+        else:
+            img_re = rf'{self.project}-{self.soc}-{self.board}-(\d+)-(\d{{8}}.*)\.img.gz'
+        print(img_re)
+        m = re.search(img_re, self.img)
+        self.version, self.subversion, = m.groups()
+
+
+class S3Paths:
+    def __init__(self, bucket_path):
+        parts = pathlib.Path(bucket_path).parts
+        self.bucket = parts[0]
+        self.path = os.path.join(*parts[1:])
+        self.urltext = urllib.parse.urljoin(f'https://{self.bucket}', self.path)
+
+
+def build_order(board):
+    packages = {}
+    pkg_num = 1
+    if board=='':
+        make_rule = 'show-build-order'
+    else:   
+        make_rule = f'{board}-show-build-order'
+    with subprocess.Popen(['make', make_rule], stdout=subprocess.PIPE, text=True) as proc:
+        for line in iter(proc.stdout.readline,''):
+            m = re.match(r'^[\w_\-]+$', line.strip("\r\n"))
+            if m:
+                packages[m[0]]=pkg_num
+                pkg_num += 1
+    return packages
+
+
+def build(board, clean=False):
+    if clean:
+        clean_suffix = 'clean'
+    else:
+        clean_suffix = ''
+
+    print(f"Building Board: {board}")
+    print(f"Determining build order...")
+    packages = build_order(board)
+
+    build_path = f'output/{board}/build'
+    logfile_path = f'{build_path}/build.log'
+    os.makedirs(build_path, exist_ok = True)
+    print(f'Logging to {logfile_path}')
+
+    print("Preparing to build Batocera packages...")
+    callback=BuildProgress(board, len(packages))
+    BuildProgress.start()
+    with subprocess.Popen(['make', f'{board}-{clean_suffix}build'], errors='replace', stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        log = open(f'{logfile_path}','w')
+        old_stage = None
+
+        for line in iter(proc.stdout.readline,''):
+            if os.fstat(log.fileno()).st_nlink == 0:
+                log.close()
+                os.makedirs(build_path, exist_ok = True)
+                log = open(f'{logfile_path}','w')
+            log.write(line)
+            log.flush()
+            m = re.match(r'.*>>> ([\w_\-]+) ([\w_\.\-]+) ([\w_\-]+)', line)
+            if m:
+                package, version, stage = m.groups()
+                callback(package, version, stage, completed=packages[package])
+                if old_stage != stage:
+                    if old_stage: 
+                        BuildProgress._progress.console.print(f'{board} {package} {old_stage} complete.')
+                    old_stage = stage
+    callback( '--', '--', '--', len(packages))
+    BuildProgress.stop()
+    return proc.returncode
+
+
+def mime_dict(src_file):
+    _, src_ext = os.path.splitext(src_file)
+    content_type = mimetypes.types_map.get(src_ext, None)
+    if content_type:
+        return { 'ContentType': content_type }
+    else:
+        return {}
+
+
+def upload(bucket_path, board, suffix=None):
+    s3 = boto3.client('s3')
+    uploads = []
+    for src in pathlib.Path().glob(f'output/{board}/images/*/images/*/*.img.gz'):
+        print(src)
+        src_parsed = ParsePath(src)
+        dst_package = BuildPackage(src_parsed, suffix=suffix)
+        dst_package.include_version = True
+        src_package = BuildPackage(src_parsed)
+        for src_f, dst_f in zip(src_package, dst_package):
+            src_file = os.path.join(src_parsed.base_path, os.path.basename(src_f))
+            print(f'source file: {src_file}')
+            upload_path = os.path.join(bucket_path, dst_f)
+            print(f'upload_path: {upload_path}')
+            p = S3Paths(upload_path)
+            callback = ProgressPercentage(src_file, p.urltext)
+            print(f'bucket: {p.bucket}')
+            print(f's3 dest: {p.path}')
+            print()
+            uploads.append( lambda p=p, callback=callback, src_file=src_file: s3.upload_file(
+                src_file, p.bucket, p.path,
+                ExtraArgs=mime_dict(src_file),
+                Callback=callback
+            ))
+    ProgressPercentage.start()
+    results = [upload() for upload in uploads]
+    ProgressPercentage.stop()
+
+
+
+if __name__ == '__main__':
+    default_board = 'rk3588'
+    default_bucket_path = 'static.st5ve.com/batocera'
+
+    parser = argparse.ArgumentParser(description='Upload Batocera images to S3')
+    parser.add_argument('--board',  metavar='BOARD',  help='The name of the board to upload images for',    default=os.environ.get('board', default_board))
+    parser.add_argument('--clean', action="store_true", help="Do a clean build.")
+    parser.add_argument('--bucket-path', metavar='BUCKET_PATH', help='The name of the S3 bucket path to upload images to', default=os.environ.get('build_bucket_path', default_bucket_path))
+    parser.add_argument('--skip-build', action="store_true", help="Skip building images and just upload.")
+    parser.add_argument('--skip-upload', action="store_true", help="Skip uploading and just build images.")
+    parser.add_argument('--suffix', metavar='SUFFIX', help='Place a suffix on the uploaded files', default=None)
+    args = parser.parse_args()
+    
+    if not args.skip_build:
+        exit_code = build(args.board, args.clean)
+        if exit_code != 0:
+            print(f"Build failed with exit code {exit_code}.")
+            sys.exit(exit_code)
+
+    if not args.skip_upload:
+        upload(args.bucket_path, args.board, args.suffix)
